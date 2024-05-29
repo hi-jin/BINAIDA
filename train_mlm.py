@@ -224,7 +224,6 @@ def main():
     parser.add_argument("--hidden_size", type=int, default=512)
     parser.add_argument("--num_layers", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.5)
-    parser.add_argument("--bidirectional", action="store_true")
     args = parser.parse_args()
 
     pl.seed_everything(2024)
