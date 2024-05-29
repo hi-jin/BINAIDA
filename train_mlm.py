@@ -58,7 +58,7 @@ class LLVMIRDataset(Dataset):
 
 
 class LLVMIRTypeInferenceModel(pl.LightningModule):
-    def __init__(self, vocab_size, embedding_dim, hidden_dim, n_layers, dropout):
+    def __init__(self, vocab_size, embedding_dim, hidden_dim, n_layers, dropout, lr, tokenizer):
         super().__init__()
         self.model = LSTMTypeInferenceLSTMModel(vocab_size, embedding_dim, hidden_dim, n_layers, dropout)
         self.vocab_size = vocab_size
@@ -66,12 +66,14 @@ class LLVMIRTypeInferenceModel(pl.LightningModule):
         self.hidden_dim = hidden_dim
         self.n_layers = n_layers
         self.dropout = dropout
+        self.lr = lr
+        self.tokenizer = tokenizer
 
     def forward(self, text):
         return self.model(text)
 
     def training_step(self, batch, batch_idx):
-        input_ids = batch["input_ids"]
+        input_ids = batch["input_ids"].squeeze(1)
         input_ids, labels = mask_tokens(input_ids, self.tokenizer)
         output = self(input_ids)
         loss = nn.CrossEntropyLoss()(output.view(-1, self.vocab_size), labels.view(-1))
@@ -79,7 +81,7 @@ class LLVMIRTypeInferenceModel(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        input_ids = batch["input_ids"]
+        input_ids = batch["input_ids"].squeeze(1)
         input_ids, labels = mask_tokens(input_ids, self.tokenizer)
         output = self(input_ids)
         loss = nn.CrossEntropyLoss()(output.view(-1, self.vocab_size), labels.view(-1))
@@ -90,25 +92,40 @@ class LLVMIRTypeInferenceModel(pl.LightningModule):
         return torch.optim.Adam(self.parameters(), lr=self.lr)
 
 
-def mask_tokens(inputs, tokenizer, mlm_probability=0.15):
+def mask_tokens(inputs, tokenizer, mask_prob=0.15):
+    """
+    Prepare masked tokens inputs/labels for masked language modeling.
+    :param inputs: Input tensor of shape (batch_size, seq_length, dimension)
+    :param mask_token_id: ID for [MASK] token
+    :param pad_token_id: ID for padding token
+    :param mask_prob: Probability of masking each token
+    :return: Tuple of masked inputs and labels
+    """
+    mask_token_id = tokenizer.mask_token_id
+    pad_token_id = tokenizer.pad_token_id
+
     labels = inputs.clone()
-    probability_matrix = torch.full(labels.shape, mlm_probability)
-    special_tokens_mask = [
-        tokenizer.get_special_tokens_mask(val, already_has_special_tokens=True) for val in labels.tolist()
-    ]
-    probability_matrix.masked_fill_(torch.tensor(special_tokens_mask, dtype=torch.bool), value=0.0)
+    
+    # Create a mask to decide which tokens to mask
+    probability_matrix = torch.full(labels.shape, mask_prob, device=inputs.device)
+    
+    # Create a mask to avoid padding tokens being masked
+    special_tokens_mask = (labels == pad_token_id)
+    probability_matrix.masked_fill_(special_tokens_mask, value=0.0)
+    
+    # Create a mask to avoid [CLS] and [SEP] tokens being masked
+    special_tokens_mask = (labels == mask_token_id)
+    probability_matrix.masked_fill_(special_tokens_mask, value=0.0)
+    
+    # Create mask tensor where each element is True if it should be masked, False otherwise
     masked_indices = torch.bernoulli(probability_matrix).bool()
-    labels[~masked_indices] = -100  # We only compute loss on masked tokens
-
-    # Replace masked input tokens with tokenizer.mask_token_id
-    indices_replaced = torch.bernoulli(torch.full(labels.shape, 0.8)).bool() & masked_indices
-    inputs[indices_replaced] = tokenizer.convert_tokens_to_ids(tokenizer.mask_token)
-
-    # Replace masked input tokens with random word
-    indices_random = torch.bernoulli(torch.full(labels.shape, 0.5)).bool() & masked_indices & ~indices_replaced
-    random_words = torch.randint(tokenizer.vocab_size, labels.shape, dtype=torch.long)
-    inputs[indices_random] = random_words[indices_random]
-
+    
+    # Set labels for masked tokens; set labels for non-masked tokens to -100
+    labels[~masked_indices] = -100
+    
+    # Replace masked input tokens with the mask token id
+    inputs[masked_indices] = mask_token_id
+    
     return inputs, labels
 
 
@@ -132,37 +149,6 @@ class LLVMIRDataModule(pl.LightningDataModule):
         return DataLoader(self.val_dataset, batch_size=self.batch_size)
 
 
-class LLVMIRTypeInferenceModel(pl.LightningModule):
-    def __init__(self, vocab_size, embedding_dim, hidden_dim, n_layers, dropout):
-        super().__init__()
-        self.model = LSTMTypeInferenceLSTMModel(vocab_size, embedding_dim, hidden_dim, n_layers, dropout)
-        self.vocab_size = vocab_size
-        self.embedding_dim = embedding_dim
-        self.hidden_dim = hidden_dim
-        self.n_layers = n_layers
-        self.dropout = dropout
-
-    def forward(self, text):
-        return self.model(text)
-
-    def training_step(self, batch, batch_idx):
-        input_ids = batch["input_ids"]
-        input_ids, labels = mask_tokens(input_ids, self.tokenizer)
-        output = self(input_ids)
-        loss = nn.CrossEntropyLoss()(output.view(-1, self.vocab_size), labels.view(-1))
-        return loss
-
-    def validation_step(self, batch, batch_idx):
-        input_ids = batch["input_ids"]
-        input_ids, labels = mask_tokens(input_ids, self.tokenizer)
-        output = self(input_ids)
-        loss = nn.CrossEntropyLoss()(output.view(-1, self.vocab_size), labels.view(-1))
-        return loss
-
-    def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=self.lr)
-
-
 def main():
     parser = ArgumentParser()
     parser.add_argument("--dataset_path", type=str, default="dataset/small_dataset")
@@ -174,7 +160,7 @@ def main():
     parser.add_argument("--n_layers", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.5)
     parser.add_argument("--tokenizer_path", type=str, default="llvmir_tokenizer")
-    parser.add_argument("--gpus", type=str, default="0")
+    parser.add_argument("--gpus", type=str, default="0,")
     args = parser.parse_args()
 
     pl.seed_everything(2024)
@@ -186,13 +172,18 @@ def main():
         args.hidden_dim,
         args.n_layers,
         args.dropout,
+        args.lr,
+        tokenizer,
     )
 
     dm = LLVMIRDataModule(args.dataset_path, tokenizer, args.batch_size)
     trainer = pl.Trainer(
-        gpus=args.gpus,
+        devices=args.gpus,
         max_epochs=args.max_epochs,
-        logger=WandbLogger(),
+        logger=WandbLogger(
+            project="llvmir_type_inference",
+            name="lstm",
+        ),
         callbacks=[ModelCheckpoint(monitor="val_loss"), EarlyStopping(monitor="val_loss")],
     )
     trainer.fit(model, dm)
