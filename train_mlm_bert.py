@@ -7,7 +7,7 @@ from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning.loggers import WandbLogger
-from transformers import BertTokenizerFast
+from transformers import BertTokenizerFast, BertForMaskedLM, BertConfig
 from argparse import ArgumentParser
 
 
@@ -52,7 +52,7 @@ def mask_tokens(inputs, tokenizer, mask_prob=0.15):
     return inputs, labels
 
 
-class LSTMTypeInferenceModel(nn.Module):
+class BERTTypeInferenceModel(nn.Module):
     def __init__(
         self,
         tokenizer: BertTokenizerFast,
@@ -62,37 +62,28 @@ class LSTMTypeInferenceModel(nn.Module):
         self.tokenizer = tokenizer
         self.parse_kwargs(kwargs)
 
-        self.embedding = nn.Embedding(tokenizer.vocab_size, self.input_size)
-        self.lstm = nn.LSTM(
-            input_size=self.input_size,
-            hidden_size=self.hidden_size,
-            num_layers=self.num_layers,
-            batch_first=True,
-            dropout=self.dropout,
-            bidirectional=self.bidirectional,
-        )
-        self.fc = nn.Linear(
-            self.hidden_size * 2 if self.bidirectional else self.hidden_size,
-            tokenizer.vocab_size,
+        self.bert = BertForMaskedLM(
+            BertConfig(
+                vocab_size=tokenizer.vocab_size,
+                hidden_size=self.hidden_size,
+                num_hidden_layers=self.num_layers,
+                num_attention_heads=self.num_attention_heads,
+                intermediate_size=self.intermediate_size,
+                max_position_embeddings=4096,
+            )
         )
 
     def parse_kwargs(self, kwargs):
-        self.input_size = get(kwargs, "input_size", 256)
-        self.hidden_size = get(kwargs, "hidden_size", 512)
-        self.num_layers = get(kwargs, "num_layers", 2)
-        self.dropout = get(kwargs, "dropout", 0.5)
-        self.bidirectional = get(kwargs, "bidirectional", True)
+        self.hidden_size = get(kwargs, "hidden_size", 768)
+        self.num_layers = get(kwargs, "num_layers", 12)
+        self.num_attention_heads = get(kwargs, "num_attention_heads", 12)
+        self.intermediate_size = get(kwargs, "intermediate_size", 3072)
 
-    def forward(self, masked_input_ids, lengths):
-        x = self.embedding(masked_input_ids)
-        x = pack_padded_sequence(x, lengths, batch_first=True, enforce_sorted=False)
-        x, _ = self.lstm(x)
-        x, _ = pad_packed_sequence(x, batch_first=True, total_length=masked_input_ids.shape[1])
-        x = self.fc(x)
-        return x
+    def forward(self, inputs):
+        return self.bert(**inputs).logits
 
     def __repr__(self):
-        return f"LSTMTypeInferenceModel(input_size={self.input_size}, hidden_size={self.hidden_size}, num_layers={self.num_layers}, dropout={self.dropout}, bidirectional={self.bidirectional})"
+        return f"BERTTypeInferenceModel(hidden_size={self.hidden_size}, num_layers={self.num_layers}, num_attention_heads={self.num_attention_heads}, intermediate_size={self.intermediate_size})"
 
 
 class LLVMIRDataset(Dataset):
@@ -140,38 +131,34 @@ class LLVMIRTypeInferenceModel(pl.LightningModule):
         self.save_hyperparameters()
 
         self.tokenizer = tokenizer
-        self.model = LSTMTypeInferenceModel(tokenizer, **kwargs)
+        self.model = BERTTypeInferenceModel(tokenizer, **kwargs)
         self.lr = get(kwargs, "lr", 1e-3)
 
-    def forward(self, masked_input_ids, lengths):
-        return self.model(masked_input_ids, lengths)
+    def forward(self, inputs):
+        return self.model(inputs)
 
     def training_step(self, batch, batch_idx):
         input_ids = batch["input_ids"].squeeze(1)
         attention_mask = batch["attention_mask"].squeeze(1)
-        lengths = attention_mask.cpu().sum(dim=1)
-        input_ids, labels = mask_tokens(input_ids, self.tokenizer)
-        output = self(input_ids, lengths)
-        loss = F.cross_entropy(
-            output.view(-1, self.tokenizer.vocab_size),
-            labels.view(-1),
-            ignore_index=-100,
-        )
+        masked_input_ids, labels = mask_tokens(input_ids, self.tokenizer)
+
+        outputs = self.model({"input_ids": masked_input_ids, "attention_mask": attention_mask})
+        loss = F.cross_entropy(outputs.view(-1, outputs.size(-1)), labels.view(-1))
+        
         self.log("train_loss", loss)
+
         return loss
 
     def validation_step(self, batch, batch_idx):
         input_ids = batch["input_ids"].squeeze(1)
         attention_mask = batch["attention_mask"].squeeze(1)
-        lengths = attention_mask.cpu().sum(dim=1)
-        input_ids, labels = mask_tokens(input_ids, self.tokenizer)
-        output = self(input_ids, lengths)
-        loss = F.cross_entropy(
-            output.view(-1, self.tokenizer.vocab_size),
-            labels.view(-1),
-            ignore_index=-100,
-        )
+        masked_input_ids, labels = mask_tokens(input_ids, self.tokenizer)
+
+        outputs = self.model({"input_ids": masked_input_ids, "attention_mask": attention_mask})
+        loss = F.cross_entropy(outputs.view(-1, outputs.size(-1)), labels.view(-1))
+
         self.log("val_loss", loss)
+
         return loss
 
     def configure_optimizers(self):
@@ -220,11 +207,10 @@ def main():
     parser.add_argument("--tokenizer_path", type=str, default="llvmir_tokenizer")
     parser.add_argument("--gpus", type=str, default="0,1")
 
-    parser.add_argument("--input_size", type=int, default=256)
-    parser.add_argument("--hidden_size", type=int, default=512)
-    parser.add_argument("--num_layers", type=int, default=2)
-    parser.add_argument("--dropout", type=float, default=0.5)
-    parser.add_argument("--bidirectional", action="store_true")
+    parser.add_argument("--hidden_size", type=int, default=768)
+    parser.add_argument("--num_layers", type=int, default=12)
+    parser.add_argument("--num_attention_heads", type=int, default=12)
+    parser.add_argument("--intermediate_size", type=int, default=3072)
     args = parser.parse_args()
 
     pl.seed_everything(2024)
